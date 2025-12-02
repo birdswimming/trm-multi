@@ -2,6 +2,10 @@
 # third-party libraries (e.g. networkx, older packages) still reference
 # (like `np.int`, `np.bool`). This avoids AttributeError on import when
 # running with newer numpy versions that may have removed those names.
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+
+
 try:
     import numpy as np
 
@@ -60,6 +64,18 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
+import datetime
+now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H_%M")
+print(now_str)
+
+from torch.utils.tensorboard import SummaryWriter
+task_name = os.environ.get("TASK_NAME", "local")
+task_log_path = f"{task_name}{now_str}"
+tensor_board_dir = "/high_perf_store2/users/gaosiyuan3/tensorboard/"
+log_dir = os.path.join(tensor_board_dir, task_log_path)
+os.makedirs(log_dir, exist_ok=True)
+writer = SummaryWriter(log_dir=log_dir)
+canvas_size = 20
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
@@ -337,6 +353,8 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     )
         except Exception:
             pass
+    else:
+        return
     model.load_state_dict(state_dict, assign=True)
 
 
@@ -420,6 +438,104 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
 
+def split_k(s, k):
+    return "\n".join(s[i:i+k] for i in range(0, len(s), k))
+
+def decode_tensor(t: torch.Tensor):
+    t = t.cpu()
+    t += (ord('0') - 1)
+    results = []
+    for row in t:
+        s = ''.join(chr(x) for x in row)
+        s = s.replace(':', '_')
+        s = s.replace(';', 'x')
+        s = split_k(s, canvas_size)
+        results.append(s)
+    return results
+
+def ascii_to_image(text, font_size=20, font_path=None, padding=10):
+    """
+    text: 字符串，每行用 '\n' 分隔
+    font_size: 字体大小
+    font_path: 等宽字体路径，如果 None 使用 Pillow 默认等宽字体
+    padding: 图片四周留白
+    """
+    lines = text.split("\n")
+    
+    # 使用等宽字体
+    if font_path is None:
+        # Pillow 自带等宽字体
+        font = ImageFont.load_default(size = font_size)
+    else:
+        font = ImageFont.truetype(font_path, size=font_size)
+
+    # 计算图片大小
+    max_width = max(font.getlength(line) for line in lines)
+    line_height = font.getbbox("A")[3] + 5  # 每行高度
+    img_height = line_height * len(lines)
+
+    img = Image.new("RGB", (int(max_width)+2*padding, img_height+2*padding), "white")
+    draw = ImageDraw.Draw(img)
+
+    for i, line in enumerate(lines):
+        draw.text((padding, padding + i*line_height), line, font=font, fill="black")
+
+    return img
+
+def plot_curve_to_image(values, padding=10):
+    fig = plt.figure(figsize=(3, 3), dpi=200)
+    plt.plot(values)
+    plt.title("Curve")
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    img = buf.reshape(h, w, 4)[..., :3]
+    plt.close(fig)
+
+    pil_img = Image.fromarray(img)
+    padded_img = Image.new("RGB", (pil_img.width+2*padding, pil_img.height+2*padding), "white")
+    padded_img.paste(pil_img, (padding, padding))
+    return padded_img
+
+def concat_horizontally_centered(images, spacing=20):
+    """横向拼接多张 Pillow 图片，并居中对齐"""
+    heights = [img.height for img in images]
+    max_h = max(heights)
+    widths = [img.width for img in images]
+    total_w = sum(widths) + spacing * (len(images)-1)
+
+    new_img = Image.new("RGB", (total_w, max_h), "white")
+
+    x = 0
+    for img in images:
+        y = (max_h - img.height) // 2  # 垂直居中
+        new_img.paste(img, (x, y))
+        x += img.width + spacing
+
+    return new_img
+
+def add_pil_to_tensorboard(img: Image.Image, tag: str, step: int):
+    img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1)  # HWC -> CHW
+    writer.add_image(tag, img_tensor, global_step=step)
+
+def generate_all_images(labels, preds, curves, out_dir="output_images"):
+    os.makedirs(out_dir, exist_ok=True)
+    N = len(labels)
+    imgs = []
+
+    for i in range(N):
+        img_label = ascii_to_image(labels[i], font_path="/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+        img_pred = ascii_to_image(preds[i], font_path="/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+        img_curve = plot_curve_to_image(curves[i].cpu().numpy())
+
+        merged = concat_horizontally_centered([img_label, img_pred, img_curve])
+        
+        imgs.append(merged)
+        # merged.save(f"{out_dir}/output_{i}.png")
+    return imgs
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -431,6 +547,7 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
 ):
     reduced_metrics = None
+    config.eval_save_outputs = ["preds", "q_halt_logits"]
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
@@ -458,17 +575,40 @@ def evaluate(
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
-
+            
+            for k, v in batch.items():
+                print(f"{k}:{v.shape}")
+            print(batch["puzzle_identifiers"])
+            
             # Forward
             inference_steps = 0
+            if rank == 0 and processed_batches == 1:
+                q_halt_list = []
+
             while True:
                 carry, loss, metrics, preds, all_finish = train_state.model(
                     carry=carry, batch=batch, return_keys=return_keys
                 )
                 inference_steps += 1
 
+                if rank == 0 and processed_batches == 1:
+                    record_index = torch.arange(0, min(preds["q_halt_logits"].size(0), 100), 5)
+                    q_halt_list.append(preds["q_halt_logits"][record_index])
+                
                 if all_finish:
                     break
+
+            if rank == 0 and processed_batches == 1:
+                record_index = torch.arange(0, min(preds["q_halt_logits"].size(0), 100), 5)
+                q_halts = torch.stack(q_halt_list, dim=-1)
+                results = preds['preds'][record_index]
+                labels = batch['labels'][record_index]
+                results_str = decode_tensor(results)
+                labels_str = decode_tensor(labels)
+                
+                imgs = generate_all_images(labels_str, results_str, q_halts)
+                for i, img in enumerate(imgs):
+                    add_pil_to_tensorboard(img, f"visual/example{i}", train_state.step)
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
@@ -503,12 +643,12 @@ def evaluate(
         save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
 
         # Save preds
-        if config.checkpoint_path is not None and len(save_preds):
-            # Each rank save predictions independently
-            os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
-            torch.save(
-                save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
-            )
+        # if config.checkpoint_path is not None and len(save_preds):
+        #     # Each rank save predictions independently
+        #     os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+        #     torch.save(
+        #         save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+        #     )
 
         del save_preds
 
@@ -600,7 +740,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.run_name is None:
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
-            config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+            config.checkpoint_path = os.path.join("checkpoints", config.project_name, task_log_path)
 
         objects = [config]
 
@@ -659,14 +799,16 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+    # log_file = open(os.path.join(config.checkpoint_path, "log.txt"), "w")
 
     # Progress bar and logger
     progress_bar = None
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        # wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        # wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
         print('Setup EMA')
@@ -685,8 +827,10 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                for k, v in metrics.items():
+                    writer.add_scalar(f"{k}", v, train_state.step)
+                
             if config.ema:
                 ema_helper.update(train_state.model)
 
@@ -711,7 +855,8 @@ def launch(hydra_config: DictConfig):
                 cpu_group=CPU_PROCESS_GROUP)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                for k, v in metrics['all'].items():
+                    writer.add_scalar(f"evaluate/{k}", v, train_state.step)
                 
             ############ Checkpointing
             if RANK == 0:

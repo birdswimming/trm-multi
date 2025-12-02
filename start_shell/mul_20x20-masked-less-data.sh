@@ -1,0 +1,13 @@
+run_name="multi_masked_tensorboard"
+torchrun --nproc-per-node 1 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 \
+  pretrain.py \
+  arch=trm \
+  data_paths="[data/multi-20x20-masked-less-data]" \
+  evaluators="[]" \
+  epochs=5000 eval_interval=1 \
+  lr=2e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+  arch.L_layers=2 \
+  arch.H_cycles=3 arch.L_cycles=6 \
+  global_batch_size=512 lr_warmup_steps=100 \
+  checkpoint_every_eval=True \
+  +run_name=${run_name} ema=True

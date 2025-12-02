@@ -1,2 +1,7 @@
 data/
 trained_models/
+__pycache__
+outputs
+wandb
+checkpoints
+*.png

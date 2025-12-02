@@ -33,8 +33,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     grid_size = None
     inputs = []
     labels = []
-    
-    with open(hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:  # type: ignore
+    with open(f"maze/{set_name}.csv", newline="") as csvfile:  # type: ignore
         reader = csv.reader(csvfile)
         next(reader)  # Skip header
         for source, q, a, rating in reader:
